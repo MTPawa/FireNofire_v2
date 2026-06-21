@@ -1,0 +1,1351 @@
+#!/usr/bin/env python3
+"""
+Multi-model fire/nofire training script.
+
+Supported --model values:
+resnet18, resnet34, resnet50, mobilenet_v2, mobilenet_v3_large,
+efficientnet_b0, efficientnet_b1, vgg16_bn, vgg19_bn, densenet121
+
+Auto features:
+- --img_size auto reads image size from data_root folder name, e.g. Dataset/128x128 -> 128x128.
+- --runs_root auto creates Runs/<ModelName>_<Size>_01/Run_XX.
+- Every run contains exactly two main folders: weights/ and results/.
+"""
+
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import argparse
+import copy
+import sys
+import csv
+import json
+import math
+import random
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import ImageFile
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, models, transforms
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    tqdm = None
+    TQDM_AVAILABLE = False
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+MODEL_ALIASES = {
+    "resnet18": "resnet18", "resnet_18": "resnet18", "resnet-18": "resnet18",
+    "resnet34": "resnet34", "resnet_34": "resnet34", "resnet-34": "resnet34",
+    "resnet50": "resnet50", "resnet_50": "resnet50", "resnet-50": "resnet50",
+    "mobilenet_v2": "mobilenet_v2", "mobilenetv2": "mobilenet_v2", "mobilenet-v2": "mobilenet_v2",
+    "mobilenet_v3_large": "mobilenet_v3_large", "mobilenetv3large": "mobilenet_v3_large", "mobilenet-v3-large": "mobilenet_v3_large",
+    "efficientnet_b0": "efficientnet_b0", "efficientnetb0": "efficientnet_b0", "efficientnet-b0": "efficientnet_b0",
+    "efficientnet_b1": "efficientnet_b1", "efficientnetb1": "efficientnet_b1", "efficientnet-b1": "efficientnet_b1",
+    "vgg16_bn": "vgg16_bn", "vgg16": "vgg16_bn", "vgg-16-bn": "vgg16_bn",
+    "vgg19_bn": "vgg19_bn", "vgg19": "vgg19_bn", "vgg-19-bn": "vgg19_bn",
+    "densenet121": "densenet121", "densenet_121": "densenet121", "densenet-121": "densenet121",
+}
+
+MODEL_DISPLAY = {
+    "resnet18": "ResNet18", "resnet34": "ResNet34", "resnet50": "ResNet50",
+    "mobilenet_v2": "MobileNetV2", "mobilenet_v3_large": "MobileNetV3Large",
+    "efficientnet_b0": "EfficientNetB0", "efficientnet_b1": "EfficientNetB1",
+    "vgg16_bn": "VGG16BN", "vgg19_bn": "VGG19BN", "densenet121": "DenseNet121",
+}
+
+
+DETAILED_HELP_TEXT = r"""
+================================================================================
+FIRE / NO-FIRE MULTI-MODEL TRAINING SCRIPT HELP
+================================================================================
+
+WHAT THIS SCRIPT DOES
+---------------------
+This script trains a pretrained CNN model for a 2-class fire/nofire dataset.
+
+It supports:
+    - Multiple model architectures
+    - Automatic image-size detection from folder name
+    - Automatic run-folder creation
+    - Separate weights/ and results/ folders
+    - Strong augmentation
+    - Regularization
+    - Freeze-then-finetune training
+    - Weighted sampler for class imbalance
+    - Validation-based model selection
+    - Separate best weights for train, val, test, and test_e
+    - Repeat training runs using --repeat X for average results
+
+DATASET STRUCTURE
+-----------------
+Your dataset should look like this:
+
+    Dataset/128x128/
+        train/
+            fire/
+            nofire/
+        val/
+            fire/
+            nofire/
+        test/
+            fire/
+            nofire/
+        test_e/
+            fire/
+            nofire/
+
+The same structure also works for:
+
+    Dataset/32x32/
+    Dataset/64x64/
+    Dataset/128x128/
+
+BASIC COMMAND
+-------------
+For normal use, write:
+
+    python train_fire_multimodel.py --model resnet18 --data_root "Dataset/128x128"
+
+The script automatically detects the image size from the folder name.
+
+So:
+
+    --data_root "Dataset/128x128"
+
+automatically means:
+
+    image size = 128x128
+
+And:
+
+    --data_root "Dataset/32x32"
+
+automatically means:
+
+    image size = 32x32
+
+SUPPORTED MODELS
+----------------
+Use one of these names with --model:
+
+    resnet18
+    resnet34
+    resnet50
+    mobilenet_v2
+    mobilenet_v3_large
+    efficientnet_b0
+    efficientnet_b1
+    vgg16_bn
+    vgg19_bn
+    densenet121
+
+MODEL ALIASES
+-------------
+These aliases also work:
+
+    resnet-18           -> resnet18
+    resnet_18           -> resnet18
+    resnet-34           -> resnet34
+    resnet_34           -> resnet34
+    resnet-50           -> resnet50
+    resnet_50           -> resnet50
+    mobilenetv2         -> mobilenet_v2
+    mobilenet-v2        -> mobilenet_v2
+    mobilenetv3large    -> mobilenet_v3_large
+    mobilenet-v3-large  -> mobilenet_v3_large
+    efficientnetb0      -> efficientnet_b0
+    efficientnet-b0     -> efficientnet_b0
+    efficientnetb1      -> efficientnet_b1
+    efficientnet-b1     -> efficientnet_b1
+    vgg16               -> vgg16_bn
+    vgg-16-bn           -> vgg16_bn
+    vgg19               -> vgg19_bn
+    vgg-19-bn           -> vgg19_bn
+    densenet-121        -> densenet121
+
+RECOMMENDED COMMANDS FOR 128x128
+--------------------------------
+
+ResNet-18:
+
+    python train_fire_multimodel.py --model resnet18 --data_root "Dataset/128x128" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+ResNet-34:
+
+    python train_fire_multimodel.py --model resnet34 --data_root "Dataset/128x128" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+ResNet-50:
+
+    python train_fire_multimodel.py --model resnet50 --data_root "Dataset/128x128" --batch_size 16 --epochs 100 --early_stop_patience 20
+
+MobileNetV2:
+
+    python train_fire_multimodel.py --model mobilenet_v2 --data_root "Dataset/128x128" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+MobileNetV3-Large:
+
+    python train_fire_multimodel.py --model mobilenet_v3_large --data_root "Dataset/128x128" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+EfficientNet-B0:
+
+    python train_fire_multimodel.py --model efficientnet_b0 --data_root "Dataset/128x128" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+EfficientNet-B1:
+
+    python train_fire_multimodel.py --model efficientnet_b1 --data_root "Dataset/128x128" --batch_size 24 --epochs 100 --early_stop_patience 20
+
+VGG16-BN:
+
+    python train_fire_multimodel.py --model vgg16_bn --data_root "Dataset/128x128" --batch_size 8 --epochs 100 --early_stop_patience 20
+
+VGG19-BN:
+
+    python train_fire_multimodel.py --model vgg19_bn --data_root "Dataset/128x128" --batch_size 8 --epochs 100 --early_stop_patience 20
+
+DenseNet-121:
+
+    python train_fire_multimodel.py --model densenet121 --data_root "Dataset/128x128" --batch_size 16 --epochs 100 --early_stop_patience 20
+
+RECOMMENDED COMMANDS FOR 32x32
+------------------------------
+
+ResNet-18:
+
+    python train_fire_multimodel.py --model resnet18 --data_root "Dataset/32x32" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+EfficientNet-B0:
+
+    python train_fire_multimodel.py --model efficientnet_b0 --data_root "Dataset/32x32" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+MobileNetV2:
+
+    python train_fire_multimodel.py --model mobilenet_v2 --data_root "Dataset/32x32" --batch_size 32 --epochs 100 --early_stop_patience 20
+
+IMPORTANT ARGUMENTS
+-------------------
+
+Model selection:
+
+    --model resnet18
+
+Dataset path:
+
+    --data_root "Dataset/128x128"
+
+Image size:
+
+    --img_size auto       Automatically detects size from folder name.
+    --img_size 128        Forces resize to 128x128.
+    --img_height 128 --img_width 256
+
+Run folder:
+
+    --runs_root auto
+        Automatically creates:
+        Runs/<ModelName>_<ImageSize>_01/Run_XX/
+
+    --runs_base Runs
+        Base folder for automatic run folders.
+
+Training:
+
+    --epochs 100
+    --batch_size 32
+    --early_stop_patience 20
+    --repeat 5
+        Runs the complete training process 5 separate times.
+
+Learning rate:
+
+    --lr 1e-4             Learning rate for frozen-backbone classifier-head training.
+    --finetune_lr 5e-5    Learning rate after unfreezing the backbone.
+
+Freeze then fine-tune:
+
+    --freeze_epochs 5
+        First 5 epochs train only classifier head.
+        After that, the full model is unfrozen and fine-tuned.
+
+Regularization:
+
+    --weight_decay 5e-4
+    --dropout 0.30
+    --label_smoothing 0.05
+
+Augmentation:
+
+    --augment strong
+    --augment basic
+    --augment off
+
+Weighted sampler:
+
+    --use_weighted_sampler auto
+    --use_weighted_sampler yes
+    --use_weighted_sampler no
+
+Device:
+
+    --device auto     Uses GPU if CUDA is available, otherwise CPU.
+    --device cuda     Forces GPU.
+    --device cpu      Forces CPU.
+
+FP16:
+
+    --use_fp16 1      Uses mixed precision when CUDA is available.
+    --use_fp16 0      Disables mixed precision.
+
+Progress bar:
+
+    --progress_bar 1
+    --progress_bar 0
+
+DataLoader workers:
+
+    --num_workers 4
+
+If Windows gives DataLoader multiprocessing issues, use:
+
+    --num_workers 0
+
+OUTPUT FOLDER STRUCTURE
+-----------------------
+The script automatically creates:
+
+    Runs/ResNet18_128x128_01/Run_01/
+        weights/
+        results/
+
+For another model:
+
+    Runs/EfficientNetB0_128x128_01/Run_01/
+        weights/
+        results/
+
+WEIGHTS FOLDER
+--------------
+The weights/ folder contains:
+
+    best_val_model.pth
+    best_val_model_state_dict_only.pth
+
+    best_train_model.pth
+    best_train_model_state_dict_only.pth
+
+    best_test_model.pth
+    best_test_model_state_dict_only.pth
+
+    best_test_e_model.pth
+    best_test_e_model_state_dict_only.pth
+
+    last_model.pth
+    last_model_state_dict_only.pth
+
+For final reporting, use:
+
+    best_val_model_state_dict_only.pth
+
+REPEAT TRAINING
+---------------
+To train the same model multiple times for better average reporting:
+
+    python train_fire_multimodel.py --model resnet18 --data_root "Dataset/128x128" --repeat 5
+
+This creates separate folders:
+
+    Run_01/
+    Run_02/
+    Run_03/
+    Run_04/
+    Run_05/
+
+The seed changes automatically for each repeat:
+
+    repeat 1 -> seed 42
+    repeat 2 -> seed 43
+    repeat 3 -> seed 44
+
+After all repeats finish, the script saves:
+
+    repeat_summary.json
+    repeat_summary.csv
+
+These contain mean and standard deviation for train/val/test/test_e results.
+
+RESULTS FOLDER
+--------------
+The results/ folder contains:
+
+    config.json
+    final_results.json
+    training_history.json
+    training_log.csv
+    class_to_idx.json
+    dataset_balance_report.json
+    plots/
+
+The plots/ folder contains:
+
+    loss_curves.png
+    accuracy_curves.png
+    learning_rate_curve.png
+    combined_training_curves.png
+
+    confusion_matrix_train_best_val_model.png
+    confusion_matrix_val_best_val_model.png
+    confusion_matrix_test_best_val_model.png
+    confusion_matrix_test_e_best_val_model.png
+
+QUICK HELP
+----------
+To show this helper:
+
+    python train_fire_multimodel.py
+
+or:
+
+    python train_fire_multimodel.py --help
+
+================================================================================
+"""
+
+
+WEIGHTS_CLASS = {
+    "resnet18": "ResNet18_Weights",
+    "resnet34": "ResNet34_Weights",
+    "resnet50": "ResNet50_Weights",
+    "mobilenet_v2": "MobileNet_V2_Weights",
+    "mobilenet_v3_large": "MobileNet_V3_Large_Weights",
+    "efficientnet_b0": "EfficientNet_B0_Weights",
+    "efficientnet_b1": "EfficientNet_B1_Weights",
+    "vgg16_bn": "VGG16_BN_Weights",
+    "vgg19_bn": "VGG19_BN_Weights",
+    "densenet121": "DenseNet121_Weights",
+}
+
+
+def str_to_bool(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+    x = str(x).strip().lower()
+    if x in ["1", "true", "yes", "y", "on"]:
+        return True
+    if x in ["0", "false", "no", "n", "off"]:
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected: use 1/0 or true/false.")
+
+
+def normalize_model_name(x: str) -> str:
+    key = str(x).strip().lower().replace(" ", "_")
+    if key not in MODEL_ALIASES:
+        raise ValueError(f"Unsupported model '{x}'. Use one of: {', '.join(sorted(set(MODEL_ALIASES.values())))}")
+    return MODEL_ALIASES[key]
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+def save_json(data: Dict[str, Any], path: Path) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+def append_csv_row(path: Path, row: Dict[str, Any], fieldnames: List[str]) -> None:
+    exists = path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def count_images(folder: Path) -> int:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+    return sum(1 for p in folder.rglob("*") if p.suffix.lower() in exts)
+
+
+def get_lr(optimizer: optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def num_trainable_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def num_total_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def get_device(device_arg: str) -> torch.device:
+    device_arg = device_arg.lower()
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda was selected, but torch.cuda.is_available() is False. Install CUDA-enabled PyTorch.")
+        return torch.device("cuda")
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    raise ValueError("--device must be auto, cuda, or cpu")
+
+
+def device_info(device: torch.device) -> Dict[str, Any]:
+    info = {
+        "selected_device": str(device),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "pytorch_version": torch.__version__,
+        "pytorch_cuda_version": torch.version.cuda,
+    }
+    if device.type == "cuda":
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        info.update({
+            "cuda_current_device_index": idx,
+            "cuda_device_name": torch.cuda.get_device_name(idx),
+            "cuda_total_memory_gb": round(props.total_memory / (1024 ** 3), 3),
+            "cuda_capability": f"{props.major}.{props.minor}",
+            "cudnn_enabled": torch.backends.cudnn.enabled,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        })
+    return info
+
+
+def resolve_data_root(args: argparse.Namespace) -> Path:
+    if args.data_root:
+        return Path(args.data_root)
+    if str(args.dataset_size).lower() == "auto":
+        raise ValueError('Use --data_root "Dataset/128x128" or set --dataset_size explicitly.')
+    return Path(args.dataset_base) / str(args.dataset_size)
+
+
+def detect_size_from_folder(data_root: Path) -> Optional[Tuple[int, int]]:
+    name = data_root.name.lower().strip()
+    m = re.search(r"(\d+)\s*x\s*(\d+)", name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"^(\d+)$", name)
+    if m:
+        s = int(m.group(1))
+        return s, s
+    return None
+
+
+def resolve_image_size(args: argparse.Namespace, data_root: Path) -> Tuple[int, int, str, str]:
+    if args.img_height is not None or args.img_width is not None:
+        if args.img_height is None or args.img_width is None:
+            raise ValueError("Use both --img_height and --img_width for non-square images.")
+        h, w = int(args.img_height), int(args.img_width)
+        return h, w, f"{h}x{w}", "manual_img_height_width"
+
+    img_size_arg = str(args.img_size).strip().lower()
+    if img_size_arg != "auto":
+        s = int(img_size_arg)
+        return s, s, f"{s}x{s}", "manual_img_size"
+
+    detected = detect_size_from_folder(data_root)
+    if detected is None:
+        raise ValueError(f"Could not detect image size from folder name '{data_root.name}'. Use --img_size 128.")
+    h, w = detected
+    return h, w, f"{h}x{w}", "auto_from_data_root_folder_name"
+
+
+def resolve_small_image_mode(args: argparse.Namespace, h: int, w: int) -> bool:
+    mode = args.small_image_mode.lower()
+    if mode == "yes":
+        return True
+    if mode == "no":
+        return False
+    if mode == "auto":
+        return max(h, w) <= 64
+    raise ValueError("--small_image_mode must be auto, yes, or no")
+
+
+def create_next_run_dir(base: Path) -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    nums = []
+    for p in base.glob("Run_*"):
+        if p.is_dir():
+            try:
+                nums.append(int(p.name.split("_")[-1]))
+            except ValueError:
+                pass
+    run = base / f"Run_{max(nums, default=0) + 1:02d}"
+    run.mkdir(parents=True, exist_ok=False)
+    return run
+
+
+def resolve_run_paths(args: argparse.Namespace, model_name: str, size_tag: str) -> Tuple[Path, Path, Path, Path, Path]:
+    if str(args.runs_root).lower() == "auto":
+        root = Path(args.runs_base) / f"{MODEL_DISPLAY[model_name]}_{size_tag}_01"
+    else:
+        root = Path(args.runs_root)
+    run_dir = create_next_run_dir(root)
+    weights_dir = run_dir / "weights"
+    results_dir = run_dir / "results"
+    plots_dir = results_dir / "plots"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    return root, run_dir, weights_dir, results_dir, plots_dir
+
+
+def progress_iterator(iterable, total: int, desc: str, enabled: bool):
+    if enabled and TQDM_AVAILABLE:
+        return tqdm(iterable, total=total, desc=desc, leave=False, dynamic_ncols=True)
+    return iterable
+
+
+def safe_set_postfix(iterator, values: Dict[str, Any]) -> None:
+    if TQDM_AVAILABLE and hasattr(iterator, "set_postfix"):
+        iterator.set_postfix(values)
+
+
+def build_transforms(h: int, w: int, mode: str) -> Tuple[transforms.Compose, transforms.Compose]:
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    mode = mode.lower()
+    if mode == "off":
+        train_t = transforms.Compose([transforms.Resize((h, w)), transforms.ToTensor(), transforms.Normalize(mean, std)])
+    elif mode == "basic":
+        train_t = transforms.Compose([
+            transforms.Resize((h, w)), transforms.RandomHorizontalFlip(0.5), transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.20, contrast=0.20, saturation=0.20, hue=0.05),
+            transforms.ToTensor(), transforms.Normalize(mean, std),
+        ])
+    elif mode == "strong":
+        train_t = transforms.Compose([
+            transforms.RandomResizedCrop((h, w), scale=(0.70, 1.00), ratio=(0.85, 1.15)),
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandomApply([transforms.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.30, hue=0.05)], p=0.85),
+            transforms.RandomAutocontrast(p=0.25),
+            transforms.RandomAdjustSharpness(sharpness_factor=2.0, p=0.20),
+            transforms.RandomRotation(15),
+            transforms.RandomAffine(degrees=0, translate=(0.08, 0.08), scale=(0.90, 1.10)),
+            transforms.RandomPerspective(distortion_scale=0.15, p=0.20),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.15),
+            transforms.ToTensor(), transforms.Normalize(mean, std),
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.12), ratio=(0.30, 3.30), value="random"),
+        ])
+    else:
+        raise ValueError("--augment must be off, basic, or strong")
+    eval_t = transforms.Compose([transforms.Resize((h, w)), transforms.ToTensor(), transforms.Normalize(mean, std)])
+    return train_t, eval_t
+
+
+def build_datasets(data_root: Path, h: int, w: int, augment: str) -> Dict[str, datasets.ImageFolder]:
+    train_t, eval_t = build_transforms(h, w, augment)
+    tfms = {"train": train_t, "val": eval_t, "test": eval_t, "test_e": eval_t}
+    out = {}
+    for split in ["train", "val", "test", "test_e"]:
+        p = data_root / split
+        if not p.exists():
+            raise FileNotFoundError(f"Missing split folder: {p}")
+        out[split] = datasets.ImageFolder(str(p), transform=tfms[split])
+    base_classes = out["train"].class_to_idx
+    if len(base_classes) != 2:
+        raise ValueError(f"Expected exactly 2 classes but found: {base_classes}")
+    for split, ds in out.items():
+        if ds.class_to_idx != base_classes:
+            raise ValueError(f"Class mismatch in {split}: {ds.class_to_idx} vs train {base_classes}")
+    return out
+
+
+def class_counts(ds: datasets.ImageFolder) -> Dict[int, int]:
+    counts = {idx: 0 for idx in ds.class_to_idx.values()}
+    for _, y in ds.samples:
+        counts[int(y)] += 1
+    return counts
+
+
+def balance_report(dsets: Dict[str, datasets.ImageFolder], data_root: Path) -> Dict[str, Any]:
+    class_to_idx = dsets["train"].class_to_idx
+    idx_to_class = {v: k for k, v in class_to_idx.items()}
+    report = {"data_root": str(data_root), "class_to_idx": class_to_idx, "idx_to_class": {str(k): v for k, v in idx_to_class.items()}, "splits": {}, "domain_checks": {}, "warnings": []}
+    for split, ds in dsets.items():
+        counts = class_counts(ds)
+        total = sum(counts.values())
+        ratio = max(counts.values()) / max(min(counts.values()), 1)
+        report["splits"][split] = {
+            "total": total,
+            "counts": {idx_to_class[i]: c for i, c in counts.items()},
+            "percentages": {idx_to_class[i]: c / max(total, 1) for i, c in counts.items()},
+            "imbalance_ratio_max_over_min": ratio,
+        }
+        if ratio >= 1.5:
+            report["warnings"].append(f"{split} is imbalanced. max/min ratio = {ratio:.3f}")
+    train_counts = class_counts(dsets["train"])
+    te_counts = class_counts(dsets["test_e"])
+    train_total = sum(train_counts.values())
+    te_total = sum(te_counts.values())
+    diffs = {}
+    for i in sorted(train_counts):
+        tr = train_counts[i] / max(train_total, 1)
+        te = te_counts[i] / max(te_total, 1)
+        diff = abs(tr - te)
+        diffs[idx_to_class[i]] = {"train_percentage": tr, "test_e_percentage": te, "absolute_difference": diff}
+        if diff >= 0.10:
+            report["warnings"].append(f"Class distribution differs between train and test_e for class '{idx_to_class[i]}': abs diff = {diff:.3f}")
+    report["domain_checks"]["train_vs_test_e_class_distribution"] = diffs
+    return report
+
+
+def make_sampler(ds: datasets.ImageFolder, mode: str, threshold: float) -> Tuple[Optional[WeightedRandomSampler], Dict[str, Any]]:
+    counts = class_counts(ds)
+    ratio = max(counts.values()) / max(min(counts.values()), 1)
+    use = mode == "yes" or (mode == "auto" and ratio >= threshold)
+    info = {"requested_mode": mode, "class_counts": {str(k): v for k, v in counts.items()}, "imbalance_ratio_max_over_min": ratio, "imbalance_threshold": threshold, "weighted_sampler_used": use}
+    if not use:
+        return None, info
+    weights_by_class = {k: 1.0 / max(v, 1) for k, v in counts.items()}
+    sample_weights = [weights_by_class[int(y)] for _, y in ds.samples]
+    return WeightedRandomSampler(torch.DoubleTensor(sample_weights), num_samples=len(sample_weights), replacement=True), info
+
+
+def build_loaders(dsets: Dict[str, datasets.ImageFolder], args: argparse.Namespace) -> Tuple[Dict[str, DataLoader], Dict[str, Any]]:
+    sampler, sampler_info = make_sampler(dsets["train"], args.use_weighted_sampler, args.weighted_sampler_threshold)
+    common = {"batch_size": args.batch_size, "num_workers": args.num_workers, "pin_memory": torch.cuda.is_available(), "persistent_workers": args.num_workers > 0}
+    loaders = {
+        "train": DataLoader(dsets["train"], shuffle=sampler is None, sampler=sampler, **common),
+        "val": DataLoader(dsets["val"], shuffle=False, **common),
+        "test": DataLoader(dsets["test"], shuffle=False, **common),
+        "test_e": DataLoader(dsets["test_e"], shuffle=False, **common),
+    }
+    return loaders, sampler_info
+
+
+def get_weights(model_name: str):
+    cls = getattr(models, WEIGHTS_CLASS[model_name])
+    return cls.DEFAULT
+
+
+def make_classifier(in_features: int, num_classes: int, dropout: float) -> nn.Module:
+    if dropout > 0:
+        return nn.Sequential(nn.Dropout(p=dropout), nn.Linear(in_features, num_classes))
+    return nn.Linear(in_features, num_classes)
+
+
+def adapt_resnet_small(model: nn.Module, pretrained: bool) -> nn.Module:
+    old = model.conv1
+    new = nn.Conv2d(3, old.out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+    if pretrained:
+        with torch.no_grad():
+            new.weight.copy_(old.weight[:, :, 2:5, 2:5])
+    model.conv1 = new
+    model.maxpool = nn.Identity()
+    return model
+
+
+def replace_head(model: nn.Module, model_name: str, num_classes: int, dropout: float) -> nn.Module:
+    if model_name.startswith("resnet"):
+        model.fc = make_classifier(model.fc.in_features, num_classes, dropout)
+    elif model_name in ["mobilenet_v2", "mobilenet_v3_large", "efficientnet_b0", "efficientnet_b1", "vgg16_bn", "vgg19_bn"]:
+        model.classifier[-1] = make_classifier(model.classifier[-1].in_features, num_classes, dropout)
+    elif model_name == "densenet121":
+        model.classifier = make_classifier(model.classifier.in_features, num_classes, dropout)
+    else:
+        raise ValueError(f"Unsupported head replacement: {model_name}")
+    return model
+
+
+def build_model(model_name: str, num_classes: int, pretrained: bool, small_image_mode: bool, dropout: float) -> nn.Module:
+    weights = get_weights(model_name) if pretrained else None
+    builders = {
+        "resnet18": models.resnet18,
+        "resnet34": models.resnet34,
+        "resnet50": models.resnet50,
+        "mobilenet_v2": models.mobilenet_v2,
+        "mobilenet_v3_large": models.mobilenet_v3_large,
+        "efficientnet_b0": models.efficientnet_b0,
+        "efficientnet_b1": models.efficientnet_b1,
+        "vgg16_bn": models.vgg16_bn,
+        "vgg19_bn": models.vgg19_bn,
+        "densenet121": models.densenet121,
+    }
+    model = builders[model_name](weights=weights)
+    if small_image_mode and model_name.startswith("resnet"):
+        model = adapt_resnet_small(model, pretrained)
+    return replace_head(model, model_name, num_classes, dropout)
+
+
+def is_head_param(model_name: str, name: str) -> bool:
+    if model_name.startswith("resnet"):
+        return name.startswith("fc.")
+    return name.startswith("classifier.")
+
+
+def set_backbone_trainable(model: nn.Module, model_name: str, trainable: bool) -> None:
+    for name, p in model.named_parameters():
+        p.requires_grad = True if is_head_param(model_name, name) else trainable
+
+
+def build_optimizer(model: nn.Module, lr: float, weight_decay: float) -> optim.Optimizer:
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("No trainable parameters.")
+    return optim.Adam(params, lr=lr, weight_decay=weight_decay)
+
+
+def build_scheduler(args: argparse.Namespace, optimizer: optim.Optimizer):
+    return optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience, threshold=args.lr_threshold, min_lr=args.min_lr)
+
+
+def confusion_matrix(y_true: List[int], y_pred: List[int], n: int) -> List[List[int]]:
+    cm = [[0 for _ in range(n)] for _ in range(n)]
+    for t, p in zip(y_true, y_pred):
+        cm[int(t)][int(p)] += 1
+    return cm
+
+
+def per_class_metrics(cm: List[List[int]]) -> Dict[str, Dict[str, float]]:
+    n = len(cm)
+    out = {}
+    for c in range(n):
+        tp = cm[c][c]
+        fp = sum(cm[r][c] for r in range(n) if r != c)
+        fn = sum(cm[c][r] for r in range(n) if r != c)
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        out[str(c)] = {"precision": precision, "recall": recall, "f1": f1, "support": sum(cm[c])}
+    return out
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device, amp_enabled: bool, num_classes: int, split_name: str, epoch: int, total_epochs: int, use_progress_bar: bool) -> Dict[str, Any]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    y_true, y_pred = [], []
+    desc = f"{split_name} {epoch}/{total_epochs}" if epoch > 0 else split_name
+    bar = progress_iterator(loader, len(loader), desc, use_progress_bar)
+    for x, y in bar:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            out = model(x)
+            loss = criterion(out, y)
+        pred = torch.argmax(out, dim=1)
+        bs = y.size(0)
+        total_loss += float(loss.item()) * bs
+        total_correct += int((pred == y).sum().item())
+        total_samples += bs
+        safe_set_postfix(bar, {"loss": f"{total_loss / max(total_samples, 1):.4f}", "acc": f"{total_correct / max(total_samples, 1):.4f}"})
+        y_true.extend(y.detach().cpu().tolist())
+        y_pred.extend(pred.detach().cpu().tolist())
+    cm = confusion_matrix(y_true, y_pred, num_classes)
+    return {"loss": total_loss / max(total_samples, 1), "accuracy": total_correct / max(total_samples, 1), "correct": total_correct, "total": total_samples, "confusion_matrix": cm, "per_class": per_class_metrics(cm)}
+
+
+def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer, scaler: torch.amp.GradScaler, device: torch.device, amp_enabled: bool, epoch: int, total_epochs: int, use_progress_bar: bool) -> Dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    bar = progress_iterator(loader, len(loader), f"Train {epoch}/{total_epochs}", use_progress_bar)
+    for x, y in bar:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            out = model(x)
+            loss = criterion(out, y)
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        pred = torch.argmax(out.detach(), dim=1)
+        bs = y.size(0)
+        total_loss += float(loss.item()) * bs
+        total_correct += int((pred == y).sum().item())
+        total_samples += bs
+        safe_set_postfix(bar, {"loss": f"{total_loss / max(total_samples, 1):.4f}", "acc": f"{total_correct / max(total_samples, 1):.4f}"})
+    return {"loss": total_loss / max(total_samples, 1), "accuracy": total_correct / max(total_samples, 1)}
+
+
+def save_best_checkpoint(monitor: str, epoch: int, model_name: str, model: nn.Module, optimizer: optim.Optimizer, scheduler, scaler: torch.amp.GradScaler, amp_enabled: bool, weights_dir: Path, metrics_all: Dict[str, Any], class_to_idx: Dict[str, int], idx_to_class: Dict[str, str], config: Dict[str, Any], history: Dict[str, Any], metric_value: float) -> None:
+    ckpt_path = weights_dir / f"best_{monitor}_model.pth"
+    sd_path = weights_dir / f"best_{monitor}_model_state_dict_only.pth"
+    ckpt = {"epoch": epoch, "model_name": model_name, "monitor": f"{monitor}_accuracy", "monitor_accuracy": metric_value, "metrics_at_save_time": metrics_all, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "scheduler_state_dict": scheduler.state_dict(), "scaler_state_dict": scaler.state_dict() if amp_enabled else None, "class_to_idx": class_to_idx, "idx_to_class": idx_to_class, "config": config}
+    torch.save(ckpt, ckpt_path)
+    torch.save(model.state_dict(), sd_path)
+    history["best"][monitor] = {"epoch": epoch, "accuracy": metric_value, "loss": metrics_all[monitor]["loss"], "checkpoint_path": str(ckpt_path), "state_dict_path": str(sd_path)}
+    if monitor == "val":
+        torch.save(ckpt, weights_dir / "best_model.pth")
+        torch.save(model.state_dict(), weights_dir / "best_model_state_dict_only.pth")
+
+
+def plot_training_curves(history: Dict[str, Any], plots_dir: Path) -> None:
+    data = history.get("epochs", [])
+    if not data:
+        return
+    epochs = [e["epoch"] for e in data]
+    lrs = [e["lr"] for e in data]
+    for metric, ylabel, fname in [("loss", "Loss", "loss_curves.png"), ("accuracy", "Accuracy", "accuracy_curves.png")]:
+        plt.figure(figsize=(10, 6))
+        for split in ["train", "val", "test", "test_e"]:
+            plt.plot(epochs, [e[split][metric] for e in data], marker="o", label=split if split != "test_e" else "Test_E")
+        plt.xlabel("Epoch"); plt.ylabel(ylabel); plt.title(f"{ylabel} Curves"); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout(); plt.savefig(plots_dir / fname, dpi=200); plt.close()
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, lrs, marker="o", label="Learning rate")
+    plt.xlabel("Epoch"); plt.ylabel("Learning rate"); plt.title("Learning Rate Schedule"); plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout(); plt.savefig(plots_dir / "learning_rate_curve.png", dpi=200); plt.close()
+    fig, axes = plt.subplots(3, 1, figsize=(11, 15))
+    for split in ["train", "val", "test", "test_e"]:
+        label = split if split != "test_e" else "Test_E"
+        axes[0].plot(epochs, [e[split]["loss"] for e in data], marker="o", label=label)
+        axes[1].plot(epochs, [e[split]["accuracy"] for e in data], marker="o", label=label)
+    axes[2].plot(epochs, lrs, marker="o", label="Learning rate")
+    for ax, title, ylabel in zip(axes, ["Loss", "Accuracy", "Learning Rate"], ["Loss", "Accuracy", "Learning rate"]):
+        ax.set_xlabel("Epoch"); ax.set_ylabel(ylabel); ax.set_title(title); ax.grid(True, alpha=0.3); ax.legend()
+    plt.tight_layout(); plt.savefig(plots_dir / "combined_training_curves.png", dpi=200); plt.close(fig)
+
+
+def plot_confusion_matrix(cm: List[List[int]], class_names: List[str], title: str, save_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm)
+    ax.set_xticks(range(len(class_names))); ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45, ha="right"); ax.set_yticklabels(class_names)
+    ax.set_xlabel("Predicted label"); ax.set_ylabel("True label"); ax.set_title(title)
+    for i in range(len(class_names)):
+        for j in range(len(class_names)):
+            ax.text(j, i, str(cm[i][j]), ha="center", va="center")
+    fig.colorbar(im, ax=ax); plt.tight_layout(); plt.savefig(save_path, dpi=200); plt.close(fig)
+
+
+def train_model(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    model_name = normalize_model_name(args.model)
+    display = MODEL_DISPLAY[model_name]
+    data_root = resolve_data_root(args)
+    img_h, img_w, size_tag, size_source = resolve_image_size(args, data_root)
+    small_image_mode = resolve_small_image_mode(args, img_h, img_w)
+    runs_root, run_dir, weights_dir, results_dir, plots_dir = resolve_run_paths(args, model_name, size_tag)
+    device = get_device(args.device)
+    info = device_info(device)
+    if device.type == "cuda":
+        try: torch.set_float32_matmul_precision("high")
+        except Exception: pass
+    amp_enabled = bool(args.use_fp16) and device.type == "cuda"
+
+    print("\n" + "="*80)
+    print("Fire/Nofire Multi-Model Training")
+    print("="*80)
+    print(f"Model              : {display} ({model_name})")
+    print(f"Data root          : {data_root}")
+    print(f"Image resize       : {img_h}x{img_w} ({size_source})")
+    print(f"Run directory      : {run_dir}")
+    print(f"Weights directory  : {weights_dir}")
+    print(f"Results directory  : {results_dir}")
+    print(f"Device             : {device}")
+    if device.type == "cuda":
+        print(f"GPU name           : {info.get('cuda_device_name')}")
+        print(f"GPU memory         : {info.get('cuda_total_memory_gb')} GB")
+    print(f"FP16 enabled       : {amp_enabled}")
+    print(f"Freeze epochs      : {args.freeze_epochs}")
+    print("="*80 + "\n")
+
+    dsets = build_datasets(data_root, img_h, img_w, args.augment)
+    bal_report = balance_report(dsets, data_root)
+    save_json(bal_report, results_dir / "dataset_balance_report.json")
+    loaders, sampler_info = build_loaders(dsets, args)
+    class_to_idx = dsets["train"].class_to_idx
+    idx_to_class = {str(v): k for k, v in class_to_idx.items()}
+    num_classes = len(class_to_idx)
+
+    model = build_model(model_name, num_classes, args.pretrained, small_image_mode, args.dropout).to(device)
+    if args.freeze_epochs > 0:
+        set_backbone_trainable(model, model_name, trainable=False)
+        phase = "frozen_backbone"
+        start_lr = args.lr
+    else:
+        set_backbone_trainable(model, model_name, trainable=True)
+        phase = "full_finetune"
+        start_lr = args.lr
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    optimizer = build_optimizer(model, start_lr, args.weight_decay)
+    scheduler = build_scheduler(args, optimizer)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+
+    config = {
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "script": "train_fire_multimodel.py",
+        "model": model_name,
+        "model_display": display,
+        "pretrained": args.pretrained,
+        "num_classes": num_classes,
+        "supported_models": sorted(set(MODEL_ALIASES.values())),
+        "image_resize": {"height": img_h, "width": img_w, "size_tag": size_tag, "source": size_source},
+        "augmentation": args.augment,
+        "regularization": {"weight_decay": args.weight_decay, "dropout": args.dropout, "label_smoothing": args.label_smoothing},
+        "freeze_then_finetune": {"freeze_epochs": args.freeze_epochs, "head_only_lr": args.lr, "finetune_lr": args.finetune_lr, "reset_scheduler_on_unfreeze": True},
+        "small_image_mode": small_image_mode,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "optimizer": "Adam",
+        "scheduler": {"name": "ReduceLROnPlateau", "mode": "max", "monitor": "val_accuracy", "factor": args.lr_factor, "patience": args.lr_patience, "threshold": args.lr_threshold, "min_lr": args.min_lr},
+        "early_stopping": {"monitor": "val_accuracy", "patience": args.early_stop_patience},
+        "weighted_sampler": sampler_info,
+        "device": str(device),
+        "device_info": info,
+        "amp_enabled": amp_enabled,
+        "seed": args.seed,
+        "paths": {"runs_root": str(runs_root), "run_dir": str(run_dir), "weights_dir": str(weights_dir), "results_dir": str(results_dir), "plots_dir": str(plots_dir)},
+        "dataset_info": {"data_root": str(data_root), "class_to_idx": class_to_idx, "idx_to_class": idx_to_class, "splits": {s: {"folder": str(data_root / s), "num_images_by_imagefolder": len(dsets[s]), "num_images_counted": count_images(data_root / s)} for s in ["train", "val", "test", "test_e"]}},
+    }
+    save_json(config, results_dir / "config.json")
+    save_json(class_to_idx, results_dir / "class_to_idx.json")
+
+    history = {"config": config, "epochs": [], "best": {m: {"epoch": None, "accuracy": -1.0, "loss": None, "checkpoint_path": str(weights_dir / f"best_{m}_model.pth"), "state_dict_path": str(weights_dir / f"best_{m}_model_state_dict_only.pth")} for m in ["val", "train", "test", "test_e"]}}
+    best = {"val": -1.0, "train": -1.0, "test": -1.0, "test_e": -1.0}
+    best_epoch = {"val": 0, "train": 0, "test": 0, "test_e": 0}
+    no_improve = 0
+    total_params = num_total_params(model)
+    csv_path = results_dir / "training_log.csv"
+    csv_fields = ["epoch", "phase", "lr", "trainable_params", "total_params", "train_loss", "train_accuracy", "val_loss", "val_accuracy", "test_loss", "test_accuracy", "test_e_loss", "test_e_accuracy", "epoch_time_sec", "is_best_val", "is_best_train", "is_best_test", "is_best_test_e", "epochs_without_improvement"]
+
+    for epoch in range(1, args.epochs + 1):
+        if args.freeze_epochs > 0 and epoch == args.freeze_epochs + 1:
+            print(f"\nUnfreezing backbone at epoch {epoch}. Switching to full fine-tuning. LR={args.finetune_lr}\n")
+            set_backbone_trainable(model, model_name, trainable=True)
+            phase = "full_finetune"
+            optimizer = build_optimizer(model, args.finetune_lr, args.weight_decay)
+            scheduler = build_scheduler(args, optimizer)
+        t0 = time.time()
+        train_m = train_one_epoch(model, loaders["train"], criterion, optimizer, scaler, device, amp_enabled, epoch, args.epochs, args.progress_bar)
+        val_m = evaluate(model, loaders["val"], criterion, device, amp_enabled, num_classes, "Val", epoch, args.epochs, args.progress_bar)
+        scheduler.step(val_m["accuracy"])
+        test_m = evaluate(model, loaders["test"], criterion, device, amp_enabled, num_classes, "Test", epoch, args.epochs, args.progress_bar)
+        teste_m = evaluate(model, loaders["test_e"], criterion, device, amp_enabled, num_classes, "Test_E", epoch, args.epochs, args.progress_bar)
+        metrics_all = {"train": train_m, "val": val_m, "test": test_m, "test_e": teste_m}
+        flags = {"val": val_m["accuracy"] > best["val"], "train": train_m["accuracy"] > best["train"], "test": test_m["accuracy"] > best["test"], "test_e": teste_m["accuracy"] > best["test_e"]}
+        if flags["val"]:
+            best["val"] = val_m["accuracy"]; best_epoch["val"] = epoch; no_improve = 0
+        else:
+            no_improve += 1
+        for mon, metrics in [("train", train_m), ("val", val_m), ("test", test_m), ("test_e", teste_m)]:
+            if flags[mon]:
+                best[mon] = metrics["accuracy"]; best_epoch[mon] = epoch
+                save_best_checkpoint(mon, epoch, model_name, model, optimizer, scheduler, scaler, amp_enabled, weights_dir, metrics_all, class_to_idx, idx_to_class, config, history, best[mon])
+        epoch_time = time.time() - t0
+        row = {"epoch": epoch, "phase": phase, "lr": get_lr(optimizer), "trainable_params": num_trainable_params(model), "total_params": total_params, "train_loss": train_m["loss"], "train_accuracy": train_m["accuracy"], "val_loss": val_m["loss"], "val_accuracy": val_m["accuracy"], "test_loss": test_m["loss"], "test_accuracy": test_m["accuracy"], "test_e_loss": teste_m["loss"], "test_e_accuracy": teste_m["accuracy"], "epoch_time_sec": epoch_time, "is_best_val": flags["val"], "is_best_train": flags["train"], "is_best_test": flags["test"], "is_best_test_e": flags["test_e"], "epochs_without_improvement": no_improve}
+        history["epochs"].append({"epoch": epoch, "phase": phase, "lr": row["lr"], "trainable_params": row["trainable_params"], "total_params": total_params, "train": train_m, "val": val_m, "test": test_m, "test_e": teste_m, "epoch_time_sec": epoch_time, "is_best_val": flags["val"], "is_best_train": flags["train"], "is_best_test": flags["test"], "is_best_test_e": flags["test_e"], "epochs_without_improvement": no_improve})
+        save_json(history, results_dir / "training_history.json")
+        append_csv_row(csv_path, row, csv_fields)
+        print(f"Epoch [{epoch:03d}/{args.epochs:03d}] Model: {display} | Phase: {phase} | LR: {row['lr']:.2e} | Train Acc: {train_m['accuracy']:.4f} | Val Acc: {val_m['accuracy']:.4f} | Test Acc: {test_m['accuracy']:.4f} | Test_E Acc: {teste_m['accuracy']:.4f} | " + ("BEST_VAL" if flags["val"] else f"No val improve: {no_improve}") + (" | BEST_TRAIN" if flags["train"] else "") + (" | BEST_TEST" if flags["test"] else "") + (" | BEST_TEST_E" if flags["test_e"] else ""))
+        plot_training_curves(history, plots_dir)
+        if no_improve >= args.early_stop_patience:
+            print(f"\nEarly stopping: validation accuracy did not improve for {args.early_stop_patience} consecutive epochs.")
+            break
+
+    torch.save({"epoch": history["epochs"][-1]["epoch"], "model_name": model_name, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "scheduler_state_dict": scheduler.state_dict(), "scaler_state_dict": scaler.state_dict() if amp_enabled else None, "class_to_idx": class_to_idx, "idx_to_class": idx_to_class, "config": config, "history": history}, weights_dir / "last_model.pth")
+    torch.save(model.state_dict(), weights_dir / "last_model_state_dict_only.pth")
+
+    best_val_path = weights_dir / "best_val_model_state_dict_only.pth"
+    if best_val_path.exists():
+        state = torch.load(best_val_path, map_location=device)
+    elif (weights_dir / "best_model_state_dict_only.pth").exists():
+        state = torch.load(weights_dir / "best_model_state_dict_only.pth", map_location=device)
+    else:
+        ckpt = torch.load(weights_dir / "best_model.pth", map_location=device, weights_only=False)
+        state = ckpt["model_state_dict"]
+    model.load_state_dict(state)
+    final_eval = {s: evaluate(model, loaders[s], criterion, device, amp_enabled, num_classes, f"Final {s}", 0, 0, args.progress_bar) for s in ["train", "val", "test", "test_e"]}
+    final_results = {"final_reporting_model": "best validation accuracy model", "model": model_name, "model_display": display, "best_epochs": best_epoch, "best_accuracies": best, "final_evaluation_using_best_val_model": final_eval, "class_to_idx": class_to_idx, "idx_to_class": idx_to_class, "run_dir": str(run_dir), "weights_dir": str(weights_dir), "results_dir": str(results_dir), "best_weight_paths": {m: {"checkpoint": str(weights_dir / f"best_{m}_model.pth"), "state_dict": str(weights_dir / f"best_{m}_model_state_dict_only.pth")} for m in ["val", "train", "test", "test_e"]}, "training_history_path": str(results_dir / "training_history.json"), "training_log_csv_path": str(csv_path), "config_path": str(results_dir / "config.json"), "dataset_balance_report_path": str(results_dir / "dataset_balance_report.json"), "image_resize": {"height": img_h, "width": img_w, "size_tag": size_tag, "source": size_source}, "device_info": info}
+    save_json(final_results, results_dir / "final_results.json")
+    class_names = [idx_to_class[str(i)] for i in range(num_classes)]
+    for split in ["train", "val", "test", "test_e"]:
+        plot_confusion_matrix(final_eval[split]["confusion_matrix"], class_names, f"{split} confusion matrix using best validation model", plots_dir / f"confusion_matrix_{split}_best_val_model.png")
+    plot_training_curves(history, plots_dir)
+    print("\nFinal results using BEST VALIDATION model:")
+    for split in ["train", "val", "test", "test_e"]:
+        print(f"{split:6s} Acc: {final_eval[split]['accuracy']:.4f}, Loss: {final_eval[split]['loss']:.4f}")
+    print("\n" + "="*80)
+    print("Training finished.")
+    print(f"Model          : {display}")
+    print(f"Image size     : {size_tag}")
+    print(f"Run folder     : {run_dir}")
+    print(f"Weights folder : {weights_dir}")
+    print(f"Results folder : {results_dir}")
+    print(f"Best val epoch : {best_epoch['val']}, Acc: {best['val']:.4f}")
+    print(f"Final results  : {results_dir / 'final_results.json'}")
+    print("="*80 + "\n")
+
+    return final_results
+
+
+# =========================
+# Repeat training helpers
+# =========================
+
+def _get_nested_value(data: Dict[str, Any], path: List[str], default: Any = None) -> Any:
+    current = data
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _mean(values: List[float]) -> float:
+    clean = [float(v) for v in values if v is not None]
+    if not clean:
+        return float("nan")
+    return sum(clean) / len(clean)
+
+
+def _std(values: List[float]) -> float:
+    clean = [float(v) for v in values if v is not None]
+    n = len(clean)
+    if n <= 1:
+        return 0.0
+    m = _mean(clean)
+    return math.sqrt(sum((x - m) ** 2 for x in clean) / (n - 1))
+
+
+def save_repeat_summary(repeat_results: List[Dict[str, Any]], summary_dir: Path) -> None:
+    """
+    Save repeat_summary.csv and repeat_summary.json after all repeats finish.
+    The summary is saved inside the parent folder that contains Run_01, Run_02, ...
+    """
+    summary_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+
+    for idx, result in enumerate(repeat_results, start=1):
+        row = {
+            "repeat": idx,
+            "model": result.get("model"),
+            "model_display": result.get("model_display"),
+            "run_dir": result.get("run_dir"),
+            "weights_dir": result.get("weights_dir"),
+            "results_dir": result.get("results_dir"),
+
+            "best_val_epoch": _get_nested_value(result, ["best_epochs", "val"]),
+            "best_train_epoch": _get_nested_value(result, ["best_epochs", "train"]),
+            "best_test_epoch": _get_nested_value(result, ["best_epochs", "test"]),
+            "best_test_e_epoch": _get_nested_value(result, ["best_epochs", "test_e"]),
+
+            "best_val_accuracy": _get_nested_value(result, ["best_accuracies", "val"]),
+            "best_train_accuracy": _get_nested_value(result, ["best_accuracies", "train"]),
+            "best_test_accuracy": _get_nested_value(result, ["best_accuracies", "test"]),
+            "best_test_e_accuracy": _get_nested_value(result, ["best_accuracies", "test_e"]),
+
+            "final_train_accuracy": _get_nested_value(result, ["final_evaluation_using_best_val_model", "train", "accuracy"]),
+            "final_val_accuracy": _get_nested_value(result, ["final_evaluation_using_best_val_model", "val", "accuracy"]),
+            "final_test_accuracy": _get_nested_value(result, ["final_evaluation_using_best_val_model", "test", "accuracy"]),
+            "final_test_e_accuracy": _get_nested_value(result, ["final_evaluation_using_best_val_model", "test_e", "accuracy"]),
+
+            "final_train_loss": _get_nested_value(result, ["final_evaluation_using_best_val_model", "train", "loss"]),
+            "final_val_loss": _get_nested_value(result, ["final_evaluation_using_best_val_model", "val", "loss"]),
+            "final_test_loss": _get_nested_value(result, ["final_evaluation_using_best_val_model", "test", "loss"]),
+            "final_test_e_loss": _get_nested_value(result, ["final_evaluation_using_best_val_model", "test_e", "loss"]),
+        }
+        rows.append(row)
+
+    csv_path = summary_dir / "repeat_summary.csv"
+
+    if rows:
+        fieldnames = list(rows[0].keys())
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    metrics_for_stats = [
+        "best_val_accuracy",
+        "best_train_accuracy",
+        "best_test_accuracy",
+        "best_test_e_accuracy",
+        "final_train_accuracy",
+        "final_val_accuracy",
+        "final_test_accuracy",
+        "final_test_e_accuracy",
+        "final_train_loss",
+        "final_val_loss",
+        "final_test_loss",
+        "final_test_e_loss",
+    ]
+
+    stats = {}
+
+    for metric in metrics_for_stats:
+        values = [row.get(metric) for row in rows if row.get(metric) is not None]
+        stats[metric] = {
+            "mean": _mean(values),
+            "std": _std(values),
+            "min": min(values) if values else None,
+            "max": max(values) if values else None,
+            "values": values
+        }
+
+    summary = {
+        "num_repeats": len(repeat_results),
+        "summary_dir": str(summary_dir),
+        "csv_path": str(csv_path),
+        "rows": rows,
+        "statistics": stats,
+        "note": (
+            "final_* metrics use the best validation model from each repeat. "
+            "Mean/std values are calculated across independent repeat runs."
+        )
+    }
+
+    save_json(summary, summary_dir / "repeat_summary.json")
+
+    print("\n" + "=" * 80)
+    print("Repeat summary saved.")
+    print(f"Summary folder : {summary_dir}")
+    print(f"CSV summary    : {csv_path}")
+    print(f"JSON summary   : {summary_dir / 'repeat_summary.json'}")
+    print("-" * 80)
+
+    for metric in ["final_val_accuracy", "final_test_accuracy", "final_test_e_accuracy"]:
+        mean_val = stats[metric]["mean"]
+        std_val = stats[metric]["std"]
+        print(f"{metric:22s}: mean={mean_val:.4f}, std={std_val:.4f}")
+
+    print("=" * 80 + "\n")
+
+
+def run_repeated_training(args: argparse.Namespace) -> None:
+    """
+    Run full training args.repeat times.
+
+    Each repeat:
+    - gets a separate Run_XX folder
+    - uses seed = base_seed + repeat_index
+    - saves its own weights/results
+    - is included in repeat_summary.csv/json
+    """
+    repeat_count = int(args.repeat)
+
+    if repeat_count < 1:
+        raise ValueError("--repeat must be >= 1")
+
+    if repeat_count == 1:
+        train_model(args)
+        return
+
+    base_seed = int(args.seed)
+    repeat_results = []
+
+    print("\n" + "=" * 80)
+    print(f"Running repeated training: {repeat_count} repeats")
+    print(f"Base seed: {base_seed}")
+    print("=" * 80 + "\n")
+
+    for repeat_idx in range(1, repeat_count + 1):
+        repeat_args = copy.deepcopy(args)
+        repeat_args.seed = base_seed + repeat_idx - 1
+
+        print("\n" + "#" * 80)
+        print(f"STARTING REPEAT {repeat_idx}/{repeat_count}")
+        print(f"Seed for this repeat: {repeat_args.seed}")
+        print("#" * 80 + "\n")
+
+        result = train_model(repeat_args)
+        repeat_results.append(result)
+
+        print("\n" + "#" * 80)
+        print(f"FINISHED REPEAT {repeat_idx}/{repeat_count}")
+        print("#" * 80 + "\n")
+
+    first_run_dir = Path(repeat_results[0]["run_dir"])
+    summary_dir = first_run_dir.parent
+
+    save_repeat_summary(repeat_results, summary_dir)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train multiple pretrained CNN models on a fire/nofire dataset.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=DETAILED_HELP_TEXT
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="resnet18",
+        help="Model to train. Options: resnet18, resnet34, resnet50, mobilenet_v2, mobilenet_v3_large, efficientnet_b0, efficientnet_b1, vgg16_bn, vgg19_bn, densenet121."
+    )
+
+    parser.add_argument("--dataset_base", type=str, default="Dataset", help="Base dataset folder used with --dataset_size. Default: Dataset")
+    parser.add_argument("--dataset_size", type=str, default="auto", help="Dataset size folder inside dataset_base, e.g. 128x128. Usually use --data_root instead.")
+    parser.add_argument("--data_root", type=str, default=None, help="Direct dataset path containing train/val/test/test_e, e.g. Dataset/128x128. Recommended.")
+
+    parser.add_argument("--img_size", type=str, default="auto", help="Image size. Default auto detects from folder name, e.g. Dataset/128x128 -> 128.")
+    parser.add_argument("--img_height", type=int, default=None, help="Optional manual image height. Use with --img_width.")
+    parser.add_argument("--img_width", type=int, default=None, help="Optional manual image width. Use with --img_height.")
+
+    parser.add_argument("--runs_base", type=str, default="Runs", help="Base folder for automatic run folders. Default: Runs")
+    parser.add_argument("--runs_root", type=str, default="auto", help="Default auto creates Runs/<Model>_<Size>_01/Run_XX. Or give a custom root folder.")
+
+    parser.add_argument("--epochs", type=int, default=100, help="Maximum training epochs.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers. Use 0 if Windows has multiprocessing issues.")
+
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="auto uses GPU if available, otherwise CPU.")
+    parser.add_argument("--use_fp16", type=str_to_bool, default=True, help="Use FP16 mixed precision on CUDA. Use 1/0.")
+
+    parser.add_argument("--pretrained", type=str_to_bool, default=True, help="Use pretrained ImageNet weights. Use 1/0.")
+    parser.add_argument("--small_image_mode", type=str, default="auto", choices=["auto", "yes", "no"], help="For small images, modifies ResNet stem when auto/yes.")
+
+    parser.add_argument("--augment", type=str, default="strong", choices=["off", "basic", "strong"], help="Training augmentation strength.")
+    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Adam weight decay.")
+    parser.add_argument("--dropout", type=float, default=0.30, help="Dropout before final classifier.")
+    parser.add_argument("--label_smoothing", type=float, default=0.05, help="CrossEntropy label smoothing.")
+
+    parser.add_argument("--freeze_epochs", type=int, default=5, help="Train classifier head only for this many epochs, then unfreeze all.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="LR for classifier-head/frozen-backbone phase.")
+    parser.add_argument("--finetune_lr", type=float, default=5e-5, help="LR after unfreezing full model.")
+
+    parser.add_argument("--use_weighted_sampler", type=str, default="auto", choices=["no", "yes", "auto"], help="Weighted sampler for class imbalance.")
+    parser.add_argument("--weighted_sampler_threshold", type=float, default=1.5, help="Use sampler in auto mode if class imbalance ratio exceeds this.")
+
+    parser.add_argument("--lr_patience", type=int, default=5, help="Reduce LR if val accuracy does not improve for this many epochs.")
+    parser.add_argument("--lr_factor", type=float, default=0.5, help="LR reduction factor.")
+    parser.add_argument("--lr_threshold", type=float, default=1e-4, help="LR scheduler improvement threshold.")
+    parser.add_argument("--min_lr", type=float, default=1e-7, help="Minimum LR.")
+    parser.add_argument("--early_stop_patience", type=int, default=20, help="Stop if val accuracy does not improve for this many epochs.")
+    parser.add_argument("--repeat", type=int, default=1, help="Run the complete training process X times. Example: --repeat 5")
+
+    parser.add_argument("--progress_bar", type=str_to_bool, default=True, help="Show tqdm progress bars. Use 1/0.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        print(DETAILED_HELP_TEXT)
+        sys.exit(0)
+
+    run_repeated_training(parse_args())
